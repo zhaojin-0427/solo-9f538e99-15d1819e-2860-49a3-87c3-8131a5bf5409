@@ -7,7 +7,6 @@ import pytest
 
 from app import core
 from app.app import create_app
-
 VTT = """WEBVTT
 
 1
@@ -79,11 +78,11 @@ def occurrence_fields(html):
 
 def fill(client, draft_id, decider, publish=False):
     page, revision, html = draft_form(client, draft_id)
-    data = {"revision": revision}
-    for index in occurrence_fields(html):
-        status, text = decider(index)
-        data[f"status:{index}"] = status
-        data[f"text:{index}"] = text
+    data = {"revision": revision, "page": "1", "scope": "all"}
+    for occurrence_id in occurrence_fields(html):
+        status, text = decider(occurrence_id)
+        data[f"status:{occurrence_id}"] = status
+        data[f"text:{occurrence_id}"] = text
     url = f"/draft/{draft_id}/" + ("publish" if publish else "save")
     return client.post(url, data=data, follow_redirects=False)
 
@@ -165,10 +164,10 @@ class TestReviewAndPublish:
         parsed = core.parse_vtt(body)
         texts = [cue.text for cue in parsed]
         assert "第一句原话。" in texts  # 整条保留沿用正文
-        # 剪口被截断的每一次出现都按各自录入的文字输出
-        assert "保留文字1" in texts
-        assert "保留文字3" in texts
+        # 剪口被截断的每一次出现都按各自录入的文字输出（按 occurrence 行号录入）
+        assert "保留文字2" in texts
         assert "保留文字4" in texts
+        assert "保留文字5" in texts
         assert len([t for t in texts if t.startswith("保留文字")]) == 3
 
     def test_deleted_cut_occurrence_absent_from_output(self, client):
@@ -344,3 +343,325 @@ class TestPersistence:
             assert core.get_edition(conn, 1) is None
         finally:
             conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 分页校订
+# ---------------------------------------------------------------------------
+
+
+def _big_fixture(fragment_total: int = 45, cue_per_fragment: int = 1):
+    """构造 fragment_total 个片段、每页 20 个必然分页的稿；每片段都带剪口。"""
+    cues = []
+    cue_idx = 0
+    csv_lines = ["片段号,原片起毫秒,原片止毫秒"]
+    # 片段依次取原片 10s 窗口，相邻窗口重叠 1s，使每条字幕都被剪口截断。
+    for i in range(fragment_total):
+        start = 2_000 + i * 9_000
+        end = start + 10_000
+        csv_lines.append(f"F{i:03d},{start},{end}")
+        for j in range(cue_per_fragment):
+            cues.append(
+                f"{cue_idx}\n"
+                f"{core.format_timestamp(max(0, start - 500))} --> "
+                f"{core.format_timestamp(start + 1_500)}\n"
+                f"字幕{i}-{j}\n"
+            )
+            cue_idx += 1
+    vtt = "WEBVTT\n\n" + "\n".join(cues)
+    return vtt, "\n".join(csv_lines) + "\n"
+
+
+def _page_html(client, draft_id, page=1, scope="all"):
+    resp = client.get(f"/draft/{draft_id}?page={page}&scope={scope}")
+    assert resp.status_code == 200
+    return resp.data.decode()
+
+
+def _shown_ordinals(html):
+    return [int(m) for m in re.findall(r"剪辑顺序第 (\d+) 个", html)]
+
+
+def _save_page(client, draft_id, html, *, status="delete", page="1", scope="all"):
+    revision = re.search(r'name="revision" value="(\d+)"', html).group(1)
+    data = {"revision": revision, "page": page, "scope": scope}
+    for occurrence_id in occurrence_fields(html):
+        data[f"status:{occurrence_id}"] = status
+        if status == "keep":
+            data[f"text:{occurrence_id}"] = f"文字{occurrence_id}"
+    return client.post(f"/draft/{draft_id}/save", data=data, follow_redirects=False)
+
+
+class TestPagination:
+    def test_page_contains_at_mast_20_fragments_in_clip_order(self, client):
+        vtt, csv_text = _big_fixture(45)
+        draft_id = upload(client, vtt=vtt, csv=csv_text)
+        page1 = _page_html(client, draft_id, 1)
+        ordinals = _shown_ordinals(page1)
+        assert len(ordinals) == 20
+        assert ordinals == list(range(1, 21))  # 按剪辑顺序
+        page3 = _page_html(client, draft_id, 3)
+        assert _shown_ordinals(page3) == list(range(41, 46))  # 末页 5 个
+        assert "第 3 / 3 页" in page3
+
+    def test_each_page_is_a_small_form(self, client):
+        vtt, csv_text = _big_fixture(45)
+        draft_id = upload(client, vtt=vtt, csv=csv_text)
+        html = _page_html(client, draft_id, 1)
+        # 一页最多 20 个片段，字段只属于本页出现，不含其他页字段
+        assert len(_shown_ordinals(html)) == 20
+        all_ids = set(occurrence_fields(html))
+        page2_ids = set(occurrence_fields(_page_html(client, draft_id, 2)))
+        assert all_ids and all_ids.isdisjoint(page2_ids)
+
+    def test_pending_scope_only_lists_fragments_with_pending_cuts(self, client):
+        vtt, csv_text = _big_fixture(45)
+        draft_id = upload(client, vtt=vtt, csv=csv_text)
+        # 初始：全部片段都有待校订剪口
+        pending_html = _page_html(client, draft_id, 1, "pending")
+        assert len(_shown_ordinals(pending_html)) == 20
+        # 把第一页（剪辑顺序前 20 个片段）全部标删
+        assert _save_page(client, draft_id, _page_html(client, draft_id, 1)).status_code == 302
+        # 待校订范围缩短为剩下 25 个片段，且从第 21 个开始，不漏不重
+        pending_after = _page_html(client, draft_id, 1, "pending")
+        assert _shown_ordinals(pending_after) == list(range(21, 41))
+        page2 = _page_html(client, draft_id, 2, "pending")
+        assert _shown_ordinals(page2) == list(range(41, 46))
+
+    def test_save_only_touches_fragments_shown_on_that_page(self, client):
+        vtt, csv_text = _big_fixture(45)
+        draft_id = upload(client, vtt=vtt, csv=csv_text)
+        conn = core.connect(client.application.config["DATABASE"])
+        try:
+            before = core.count_pending(conn, draft_id)
+            assert before == 89
+            html = _page_html(client, draft_id, 2)  # 只显示第 21-40 个片段
+            page_fields = len(occurrence_fields(html))
+            assert _save_page(client, draft_id, html, page="2").status_code == 302
+            after = core.count_pending(conn, draft_id)
+            assert after == before - page_fields  # 恰好本页出现被处理
+            # 仍有待校订的片段数 = 45 - 20
+            assert core.count_pending_fragments(conn, draft_id) == 25
+        finally:
+            conn.close()
+
+    def test_walk_every_page_until_no_pending_then_publish_succeeds(self, client):
+        vtt, csv_text = _big_fixture(45)
+        draft_id = upload(client, vtt=vtt, csv=csv_text)
+        # 按待校订范围逐页处理，直到列表为空
+        page = 1
+        while True:
+            html = _page_html(client, draft_id, page, "pending")
+            if not occurrence_fields(html):
+                break
+            resp = _save_page(client, draft_id, html, page=str(page), scope="pending")
+            assert resp.status_code == 302
+            page += 1
+        assert page == 4  # 20 + 20 + 5 三页处理完，第四页为空
+        last = _page_html(client, draft_id, 1, "pending")
+        assert "没有待校订的剪口" in last
+        # 全稿待校订数为 0 才允许发布
+        revision = re.search(r'name="revision" value="(\d+)"', last).group(1)
+        published = client.post(
+            f"/draft/{draft_id}/publish",
+            data={"revision": revision, "page": "1", "scope": "pending"},
+        )
+        assert published.status_code == 302
+        assert "/editions/1" in published.headers["Location"]
+
+    def test_redirect_after_last_pending_page_recovers_to_valid_page(self, client):
+        vtt, csv_text = _big_fixture(45)
+        draft_id = upload(client, vtt=vtt, csv=csv_text)
+        for p in (1, 2):
+            html = _page_html(client, draft_id, p, "pending")
+            rev = re.search(r'name="revision" value="(\d+)"', html).group(1)
+            data = {"revision": rev, "page": str(p), "scope": "pending"}
+            for oid in occurrence_fields(html):
+                data[f"status:{oid}"] = "delete"
+            client.post(f"/draft/{draft_id}/save", data=data)
+        # 最后一页（第 3 页）保存后重定向回 page=3，但已无待校订片段
+        html = _page_html(client, draft_id, 3, "pending")
+        rev = re.search(r'name="revision" value="(\d+)"', html).group(1)
+        data = {"revision": rev, "page": "3", "scope": "pending"}
+        for oid in occurrence_fields(html):
+            data[f"status:{oid}"] = "delete"
+        resp = client.post(f"/draft/{draft_id}/save", data=data)
+        assert resp.status_code == 302
+        body = client.get(resp.headers["Location"]).data.decode()
+        assert "没有待校订的剪口" in body
+        assert "第 1 / 1 页" in body  # 页码回收到有效页，不显示 3 / 1
+
+    def test_saved_decisions_can_be_reviewed_and_modified(self, client):
+        vtt, csv_text = _big_fixture(25)
+        draft_id = upload(client, vtt=vtt, csv=csv_text)
+        html = _page_html(client, draft_id, 1)
+        first_id = occurrence_fields(html)[0]
+        revision = re.search(r'name="revision" value="(\d+)"', html).group(1)
+        client.post(
+            f"/draft/{draft_id}/save",
+            data={
+                "revision": revision,
+                "page": "1",
+                "scope": "all",
+                f"status:{first_id}": "keep",
+                f"text:{first_id}": "初次录入",
+            },
+        )
+        reopened = _page_html(client, draft_id, 1)
+        assert "初次录入" in reopened  # 回看已存校订
+        # 改成删除后再存
+        revision2 = re.search(r'name="revision" value="(\d+)"', reopened).group(1)
+        client.post(
+            f"/draft/{draft_id}/save",
+            data={
+                "revision": revision2,
+                "page": "1",
+                "scope": "all",
+                f"status:{first_id}": "delete",
+            },
+        )
+        conn = core.connect(client.application.config["DATABASE"])
+        try:
+            decisions = core.decision_rows(conn, draft_id)
+            kept = [d for d in decisions.values() if d["status"] == "keep"]
+            assert not kept or all(d["signature"] for d in decisions.values())
+            assert any(d["status"] == "delete" for d in decisions.values())
+        finally:
+            conn.close()
+
+    def test_page_shows_total_pending_count_of_whole_draft(self, client):
+        vtt, csv_text = _big_fixture(45)
+        draft_id = upload(client, vtt=vtt, csv=csv_text)
+        html = _page_html(client, draft_id, 2)
+        assert "全稿待校订" in html
+        assert re.search(r"全稿待校订\s*<strong[^>]*>89</strong>", html)
+        # 处理完第一页片段后，全稿计数随之下降，第二页看到的是全稿最新值
+        _save_page(client, draft_id, _page_html(client, draft_id, 1))
+        conn = core.connect(client.application.config["DATABASE"])
+        try:
+            remaining = core.count_pending(conn, draft_id)
+        finally:
+            conn.close()
+        html2 = _page_html(client, draft_id, 2)
+        assert re.search(
+            rf"全稿待校订\s*<strong[^>]*>{remaining}</strong>", html2
+        )
+        assert remaining < 89
+
+
+class TestPersistenceBackfill:
+    def test_legacy_sqlite_volume_is_backfilled_once_and_then_not_recomputed(
+        self, tmp_path, monkeypatch
+    ):
+        db = str(tmp_path / "legacy.db")
+        # 1) 用当前代码建一个有校订的草稿
+        first = create_app(db)
+        first.config.update(TESTING=True)
+        client = first.test_client()
+        draft_id = upload(client)
+        fill(client, draft_id, lambda index: ("delete", ""), publish=False)
+        conn = core.connect(db)
+        try:
+            assert core.is_persisted(conn, draft_id)
+        finally:
+            conn.close()
+
+        # 2) 模拟旧卷：删掉持久化表内容，只保留 draft/decision/edition。
+        conn = core.connect(db)
+        try:
+            conn.execute("DELETE FROM occurrence")
+            conn.execute("DELETE FROM fragment")
+            assert not core.is_persisted(conn, draft_id)
+        finally:
+            conn.close()
+
+        # 3) 首次载入触发一次性回填，旧草稿与校订接着用
+        second = create_app(db)
+        second.config.update(TESTING=True)
+        client2 = second.test_client()
+        page = client2.get(f"/draft/{draft_id}")
+        assert page.status_code == 200
+        conn = core.connect(db)
+        try:
+            assert core.is_persisted(conn, draft_id)
+            stats = core.draft_statistics(conn, draft_id)
+            assert stats["fragment_count"] == 3
+            assert stats["pending_count"] == 0  # 回填前保存的删除校订仍有效
+        finally:
+            conn.close()
+
+        # 4) 回填后再打开/保存都不重算：监视 compute_occurrences 不应再被调用
+        calls = {"n": 0}
+        original = core.compute_occurrences
+
+        def _spy(cuts, cues):
+            calls["n"] += 1
+            return original(cuts, cues)
+
+        monkeypatch.setattr(core, "compute_occurrences", _spy)
+        assert client2.get(f"/draft/{draft_id}?page=1&scope=pending").status_code == 200
+        html = client2.get(f"/draft/{draft_id}").data.decode()
+        revision = re.search(r'name="revision" value="(\d+)"', html).group(1)
+        resp = client2.post(
+            f"/draft/{draft_id}/save",
+            data={"revision": revision, "page": "1", "scope": "all"},
+        )
+        assert resp.status_code in (302, 409)
+        assert calls["n"] == 0
+
+    def test_legacy_draft_backfill_then_full_publish(self, tmp_path):
+        db = str(tmp_path / "legacy2.db")
+        application = create_app(db)
+        application.config.update(TESTING=True)
+        client = application.test_client()
+        draft_id = upload(client)
+        conn = core.connect(db)
+        try:
+            conn.execute("DELETE FROM occurrence")
+            conn.execute("DELETE FROM fragment")
+        finally:
+            conn.close()
+        # 回填 + 逐页处理 + 发布
+        fill(client, draft_id, lambda index: ("keep", f"回填校订{index}"), publish=True)
+        body = client.get("/editions/1/download").data.decode()
+        assert body.startswith("WEBVTT")
+        # WebVTT 按剪辑顺序输出：节选起点单调不减
+        parsed = core.parse_vtt(body)
+        starts = [cue.start_ms for cue in parsed]
+        assert starts == sorted(starts)
+
+
+class TestOversizeAndStale:
+    def test_form_over_limit_is_rejected_with_friendly_message(self, client):
+        draft_id = upload(client)
+        huge = "字" * (33 * 1024 * 1024)
+        revision = draft_form(client, draft_id)[1]
+        resp = client.post(
+            f"/draft/{draft_id}/save",
+            data={"revision": revision, "page": "1", "scope": "all",
+                  "status:1": "keep", "text:1": huge},
+        )
+        assert resp.status_code == 302
+        followed = client.get(resp.headers["Location"])
+        assert "32 MiB" in followed.data.decode()
+        # 没有任何校订写入
+        conn = core.connect(client.application.config["DATABASE"])
+        try:
+            assert core.decision_rows(conn, draft_id) == {}
+        finally:
+            conn.close()
+
+    def test_stale_submit_after_csv_change_prompts_refresh_with_paging(self, client):
+        old_id = upload(client)
+        old_html = draft_form(client, old_id)[2]
+        fields = occurrence_fields(old_html)
+        new_id = upload(client, csv=CSV.replace("00:00:12.000", "00:00:11.000"))
+        assert new_id != old_id
+        data = {"revision": draft_form(client, old_id)[1], "page": "1", "scope": "all"}
+        for occurrence_id in fields:
+            data[f"status:{occurrence_id}"] = "delete"
+        resp = client.post(f"/draft/{old_id}/save", data=data)
+        assert resp.status_code == 409
+        body = resp.data.decode()
+        assert "刷新" in body
+        assert "页面已过期" in body

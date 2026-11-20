@@ -29,11 +29,16 @@
     <div><dt>片段</dt><dd>{{ draft.fragment_count }}</dd></div>
     <div><dt>出现</dt><dd>{{ draft.occurrence_count }}</dd></div>
     <div><dt>剪口字幕</dt><dd>{{ draft.cut_count }}</dd></div>
-    <div><dt>待处理</dt><dd class="{{ 'warn' if draft.pending_count else 'ok' }}">{{ draft.pending_count }}</dd></div>
+    <div><dt>全稿待校订</dt><dd class="{{ 'warn' if draft.pending_count else 'ok' }}">{{ draft.pending_count }}</dd></div>
     <div><dt>节选总长</dt><dd>{{ draft.total_ms | ts }}</dd></div>
   </dl>
   <p class="hint">{{ draft.vtt_filename }} · {{ draft.csv_filename }} · 版本锁 {{ draft.revision }}</p>
-  <p><a class="button" href="{{ url_for('draft_page', draft_id=draft.id) }}">继续校订</a></p>
+  <p>
+    <a class="button" href="{{ url_for('draft_page', draft_id=draft.id) }}">继续校订</a>
+    {% if draft.pending_count %}
+    <a class="button primary" href="{{ url_for('draft_page', draft_id=draft.id, scope='pending') }}">看待校订剪口（{{ draft.pending_count }} 处）</a>
+    {% endif %}
+  </p>
 </section>
 {% endif %}
 

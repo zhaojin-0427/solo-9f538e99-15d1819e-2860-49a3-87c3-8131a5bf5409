@@ -4,7 +4,7 @@
 {% if stale %}
 <div class="banner error">
   <strong>页面已过期。</strong> {{ stale_message }}
-  <a class="button" href="{{ url_for('draft_page', draft_id=row.id) }}">刷新此页</a>
+  <a class="button" href="{{ url_for('draft_page', draft_id=row.id, page=page, scope=scope) }}">刷新此页</a>
   <a class="button" href="{{ url_for('index') }}">回到工作台</a>
 </div>
 {% elif error %}
@@ -17,7 +17,7 @@
     <div><dt>片段</dt><dd>{{ fragment_count }}</dd></div>
     <div><dt>出现</dt><dd>{{ occurrence_count }}</dd></div>
     <div><dt>剪口字幕</dt><dd>{{ cut_count }}</dd></div>
-    <div><dt>待处理</dt><dd class="{{ 'warn' if pending_count else 'ok' }}">{{ pending_count }}</dd></div>
+    <div><dt>全稿待校订</dt><dd class="{{ 'warn' if pending_count else 'ok' }}">{{ pending_count }}</dd></div>
     <div><dt>节选总长</dt><dd>{{ total_ms | ts }}</dd></div>
   </dl>
   <p class="hint">
@@ -25,18 +25,37 @@
     版本锁 {{ row.revision }}
   </p>
   <p class="hint">
-    整条保留的字幕沿用正文；剪口截断的字幕须逐次录入保留文字，或标为删除。全部处理完才能发布。
+    整条保留的字幕沿用正文；剪口截断的字幕须逐次录入保留文字，或标为删除。按剪辑顺序分页校订，每页最多 {{ page_size }} 个片段，全部处理完才能发布。
   </p>
+
+  <nav class="scope-tabs" aria-label="校订范围">
+    <a class="tab {{ 'active' if scope == 'all' else '' }}"
+       href="{{ url_for('draft_page', draft_id=row.id, page=1, scope='all') }}">全部片段</a>
+    <a class="tab {{ 'active' if scope == 'pending' else '' }}"
+       href="{{ url_for('draft_page', draft_id=row.id, page=1, scope='pending') }}">仅含待校订剪口</a>
+  </nav>
 </section>
 
 <form method="post" action="{{ url_for('save', draft_id=row.id) }}" id="review-form">
   <input type="hidden" name="revision" value="{{ row.revision }}">
+  <input type="hidden" name="page" value="{{ page }}">
+  <input type="hidden" name="scope" value="{{ scope }}">
+
+  {% if not cards %}
+  <section class="panel">
+    {% if scope == 'pending' %}
+    <p class="hint">当前没有待校订的剪口，全部剪口都已处理，可以发布。</p>
+    {% else %}
+    <p class="hint">这一页没有片段。</p>
+    {% endif %}
+  </section>
+  {% endif %}
 
   {% for card in cards %}
   {% set fragment = card.fragment %}
   <section class="panel fragment">
     <header class="fragment-head">
-      <h2>片段 {{ fragment.fragment_no }}</h2>
+      <h2>片段 {{ fragment.fragment_no }} <small class="ordinal">（剪辑顺序第 {{ fragment.order + 1 }} 个）</small></h2>
       <div class="timepairs">
         <span class="pair"><small>原片</small> {{ fragment.start_ms | ts }} – {{ fragment.end_ms | ts }}</span>
         <span class="pair"><small>节选</small> {{ fragment.excerpt_start | ts }} – {{ fragment.excerpt_end | ts }}</span>
@@ -50,7 +69,7 @@
     {% for item in card.occurrences %}
     {% set occ = item.occ %}
     <article class="occ {{ 'cut' if occ.kind == 'cut' else 'whole' }} {{ 'pending' if item.pending else '' }}"
-             id="occ-{{ item.index }}">
+             id="occ-{{ occ.id }}">
       <div class="occ-head">
         <span class="badge {{ occ.kind }}">
           {% if occ.kind == 'cut' %}剪口截断{% else %}整条保留{% endif %}
@@ -58,8 +77,8 @@
         <span class="cue-no">原字幕 #{{ occ.cue_index + 1 }}</span>
         <span class="pair"><small>原片</small> {{ occ.ov_start | ts }} – {{ occ.ov_end | ts }}</span>
         <span class="pair"><small>节选</small> {{ occ.out_start | ts }} – {{ occ.out_end | ts }}</span>
-        {% if item.cut_start %}<span class="chip">起端截断</span>{% endif %}
-        {% if item.cut_end %}<span class="chip">末端截断</span>{% endif %}
+        {% if occ.cut_start %}<span class="chip">起端截断</span>{% endif %}
+        {% if occ.cut_end %}<span class="chip">末端截断</span>{% endif %}
         {% if item.inherited %}<span class="chip inherited">沿用上一版校订</span>{% endif %}
         {% if item.pending %}<span class="chip pending">待处理</span>{% endif %}
       </div>
@@ -71,16 +90,16 @@
       {% else %}
       <fieldset class="decision" {{ 'disabled' if stale }}>
         <label class="inline">
-          <input type="radio" name="status:{{ item.index }}" value="keep"
+          <input type="radio" name="status:{{ occ.id }}" value="keep"
                  {{ 'checked' if item.decision and item.decision.status == 'keep' }}>
           保留文字
         </label>
         <label class="inline">
-          <input type="radio" name="status:{{ item.index }}" value="delete"
+          <input type="radio" name="status:{{ occ.id }}" value="delete"
                  {{ 'checked' if item.decision and item.decision.status == 'delete' }}>
           标为删除
         </label>
-        <textarea name="text:{{ item.index }}" rows="2"
+        <textarea name="text:{{ occ.id }}" rows="2"
                   placeholder="录入保留的字幕文字（仅此一次出现）">{{ item.decision.text if item.decision and item.decision.status == 'keep' else '' }}</textarea>
       </fieldset>
       {% endif %}
@@ -89,12 +108,30 @@
   </section>
   {% endfor %}
 
+  <nav class="pager panel" aria-label="分页">
+    {% if page > 1 %}
+    <a class="button" href="{{ url_for('draft_page', draft_id=row.id, page=page - 1, scope=scope) }}">← 上一页</a>
+    {% else %}
+    <span class="button disabled">← 上一页</span>
+    {% endif %}
+    <span class="pageinfo">
+      第 {{ page }} / {{ pages }} 页 ·
+      {% if scope == 'pending' %}待校订片段 {{ scope_total }} 个{% else %}片段 {{ scope_total }} 个{% endif %}
+      · 全稿待校订 <strong class="{{ 'warn' if pending_count else 'ok' }}">{{ pending_count }}</strong> 处
+    </span>
+    {% if page < pages %}
+    <a class="button" href="{{ url_for('draft_page', draft_id=row.id, page=page + 1, scope=scope) }}">下一页 →</a>
+    {% else %}
+    <span class="button disabled">下一页 →</span>
+    {% endif %}
+  </nav>
+
   <div class="actions">
     <button type="submit" class="primary" formaction="{{ url_for('save', draft_id=row.id) }}" {{ 'disabled' if stale }}>
-      保存校订
+      保存本页校订
     </button>
     <button type="submit" class="primary publish" formaction="{{ url_for('publish', draft_id=row.id) }}" {{ 'disabled' if stale or pending_count }}>
-      发布{% if pending_count %}（还有 {{ pending_count }} 处未处理）{% endif %}
+      发布{% if pending_count %}（全稿还有 {{ pending_count }} 处待校订）{% endif %}
     </button>
   </div>
 </form>

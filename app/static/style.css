@@ -131,6 +131,27 @@ blockquote.original {
 
 .actions { position: sticky; bottom: 0; display: flex; gap: .8rem; padding: 1rem 1.2rem; background: rgba(255,255,255,.96); border: 1px solid var(--line); border-radius: 6px; }
 
+.scope-tabs { display: flex; gap: .5rem; margin-top: .9rem; flex-wrap: wrap; }
+.scope-tabs .tab {
+  padding: .35rem .9rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  text-decoration: none;
+  color: var(--muted);
+  background: #f7f5f1;
+  font-size: .9rem;
+}
+.scope-tabs .tab.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+.fragment-head h2 small.ordinal { color: var(--muted); font-weight: 400; font-size: .8rem; }
+
+.pager { display: flex; align-items: center; gap: 1rem; justify-content: space-between; }
+.pager .pageinfo { color: var(--muted); font-size: .9rem; }
+.pager .pageinfo .warn { color: var(--warn); }
+.pager .pageinfo .ok { color: var(--ok); }
+.button.disabled { opacity: .45; pointer-events: none; }
+.facts dd.warn, .facts dd.ok { font-variant-numeric: tabular-nums; }
+
 pre.vtt {
   background: #fbfaf7;
   border: 1px solid var(--line);

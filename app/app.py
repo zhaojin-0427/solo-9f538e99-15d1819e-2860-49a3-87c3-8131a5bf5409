@@ -16,11 +16,13 @@ from flask import (
     send_file,
     url_for,
 )
+from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.utils import secure_filename
 
 from . import core
 
 DEFAULT_DB = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "oral_history.db")
+SCOPES = ("all", "pending")
 
 
 def create_app(database_path: str | None = None) -> Flask:
@@ -41,29 +43,31 @@ def create_app(database_path: str | None = None) -> Flask:
     def _ts(value: int) -> str:
         return core.format_timestamp(value)
 
+    @app.errorhandler(RequestEntityTooLarge)
+    def _too_large(_exc):
+        flash(
+            "本次提交超过 32 MiB 上限，服务器没有保存任何内容。"
+            "请回到草稿页按页校订，每页最多 20 个片段。",
+            "error",
+        )
+        return redirect(url_for("index"))
+
     @app.get("/")
     def index():
         conn = get_db()
         draft = core.active_draft(conn)
         draft_info = None
         if draft is not None:
-            bundle = core.load_bundle(conn, draft["id"])
+            # 旧卷首次进入工作台时完成一次性回填；之后不再重算。
+            core.ensure_persisted(conn, draft["id"])
+            stats = core.draft_statistics(conn, draft["id"])
             draft_info = {
                 "id": draft["id"],
                 "revision": draft["revision"],
                 "vtt_filename": draft["vtt_filename"],
                 "csv_filename": draft["csv_filename"],
                 "created_at": draft["created_at"],
-                "fragment_count": len(bundle["cuts"]),
-                "cue_count": len(bundle["cues"]),
-                "occurrence_count": len(bundle["occurrences"]),
-                "cut_count": sum(
-                    1 for occ in bundle["occurrences"] if occ.kind == core.CUT
-                ),
-                "pending_count": len(
-                    core.pending_occurrences(bundle["fragments"], bundle["decisions"])
-                ),
-                "total_ms": sum(f.duration_ms for f in bundle["fragments"]),
+                **stats,
             }
         return render_template(
             "index.html", draft=draft_info, editions=core.list_editions(conn)
@@ -117,62 +121,21 @@ def create_app(database_path: str | None = None) -> Flask:
     @app.get("/draft/<int:draft_id>")
     def draft_page(draft_id: int):
         conn = get_db()
-        bundle = core.load_bundle(conn, draft_id)
-        if bundle is None:
+        if core.load_draft(conn, draft_id) is None:
             abort(404)
-        view = _draft_view(conn, bundle)
+        # 旧草稿首次载入：此处一次性回填，整份草稿生命周期仅此一次重算。
+        core.ensure_persisted(conn, draft_id)
+        page, scope = _page_params()
+        view = _draft_view(conn, draft_id, page, scope)
         return render_template("draft.html", **view), (409 if view["stale"] else 200)
 
     @app.post("/draft/<int:draft_id>/save")
     def save(draft_id: int):
-        conn = get_db()
-        bundle = core.load_bundle(conn, draft_id)
-        if bundle is None:
-            abort(404)
-        if bundle["stale"]:
-            return _stale_response(conn, draft_id)
-        revision = _form_revision()
-        changes = _collect_changes(bundle, request.form)
-        try:
-            core.save_decisions(conn, draft_id, revision, changes)
-        except core.StaleDraft:
-            return _stale_response(conn, draft_id)
-        except core.ValidationError as exc:
-            flash(str(exc), "error")
-            return redirect(url_for("draft_page", draft_id=draft_id))
-        flash("校订已保存。", "ok")
-        return redirect(url_for("draft_page", draft_id=draft_id))
+        return _submit(draft_id, publish=False)
 
     @app.post("/draft/<int:draft_id>/publish")
     def publish(draft_id: int):
-        conn = get_db()
-        bundle = core.load_bundle(conn, draft_id)
-        if bundle is None:
-            abort(404)
-        if bundle["stale"]:
-            return _stale_response(conn, draft_id)
-        revision = _form_revision()
-        changes = _collect_changes(bundle, request.form)
-        try:
-            # 页面上的编辑与发布一次提交：先按同一版本号保存，再发布。
-            if changes:
-                core.save_decisions(conn, draft_id, revision, changes)
-            version_no = core.publish(conn, draft_id, revision)
-        except core.StaleDraft:
-            return _stale_response(conn, draft_id)
-        except core.ValidationError as exc:
-            flash(str(exc), "error")
-            return redirect(url_for("draft_page", draft_id=draft_id))
-        except core.PublishBlocked as exc:
-            bundle = core.load_bundle(conn, draft_id)
-            view = _draft_view(conn, bundle)
-            view["error"] = (
-                f"还有 {len(exc.pending)} 处剪口字幕未处理，处理完才能发布。"
-                "已处理的内容已保留。"
-            )
-            return render_template("draft.html", **view), 422
-        flash(f"已发布第 {version_no} 版。", "ok")
-        return redirect(url_for("edition_detail", version_no=version_no))
+        return _submit(draft_id, publish=True)
 
     @app.get("/editions")
     def editions():
@@ -224,6 +187,17 @@ def close_db(_exc=None) -> None:
         conn.close()
 
 
+def _page_params() -> tuple[int, str]:
+    try:
+        page = int(request.args.get("page", "1"))
+    except (TypeError, ValueError):
+        page = 1
+    scope = request.args.get("scope", "all")
+    if scope not in SCOPES:
+        scope = "all"
+    return max(1, page), scope
+
+
 def _form_revision() -> int:
     try:
         return int(request.form.get("revision", ""))
@@ -231,75 +205,77 @@ def _form_revision() -> int:
         abort(400, "缺少校订版本号")
 
 
-def _collect_changes(bundle: dict, form) -> list[dict]:
-    """按出现的表单序号收集校订：status:<n> / text:<n>。"""
+def _form_page() -> tuple[int, str]:
+    try:
+        page = int(request.form.get("page", "1"))
+    except (TypeError, ValueError):
+        page = 1
+    scope = request.form.get("scope", "all")
+    if scope not in SCOPES:
+        scope = "all"
+    return max(1, page), scope
+
+
+def _collect_changes(form) -> list[dict]:
+    """只收集本次表单显示的出现（按持久化 occurrence id）：id:<n> / text:<n>。"""
     changes: list[dict] = []
-    for index, occ in enumerate(bundle["occurrences"]):
-        if occ.kind != core.CUT:
+    for key in form.keys():
+        if not key.startswith("status:"):
             continue
-        status = form.get(f"status:{index}")
-        if status is None:
+        occurrence_id = key[len("status:") :]
+        try:
+            occurrence_id = int(occurrence_id)
+        except ValueError:
             continue
         changes.append(
             {
-                "signature": occ.signature,
-                "status": status,
-                "text": form.get(f"text:{index}", ""),
+                "occurrence_id": occurrence_id,
+                "status": form.get(key),
+                "text": form.get(f"text:{occurrence_id}", ""),
             }
         )
+    changes.sort(key=lambda item: item["occurrence_id"])
     return changes
 
 
-def _stale_response(conn, draft_id: int):
-    bundle = core.load_bundle(conn, draft_id)
+def _draft_view(conn, draft_id: int, page: int, scope: str) -> dict:
+    bundle = core.load_page(conn, draft_id, page, scope)
     if bundle is None:
         abort(404)
-    view = _draft_view(conn, bundle)
-    view["stale"] = True
-    view["stale_message"] = "校订页已过期：剪辑表已更换或该页已提交过，请刷新后重新录入。"
-    return render_template("draft.html", **view), 409
-
-
-def _draft_view(conn, bundle: dict) -> dict:
     row = bundle["row"]
-    fragments = bundle["fragments"]
     decisions = bundle["decisions"]
-
-    previous = conn.execute(
-        "SELECT id FROM draft WHERE id < ? ORDER BY id DESC LIMIT 1", (row["id"],)
-    ).fetchone()
-    previous_decisions = (
-        core.decision_rows(conn, previous["id"]) if previous is not None else {}
-    )
+    inherited = bundle["inherited"]
+    stats = bundle["stats"]
 
     cards = []
-    occurrence_index = -1
-    for fragment in fragments:
+    for fragment in bundle["fragments"]:
         frag_cards = []
         for occ in fragment.occurrences:
-            occurrence_index += 1
             decision = decisions.get(occ.signature)
             frag_cards.append(
                 {
-                    "index": occurrence_index,
                     "occ": occ,
                     "decision": decision,
-                    "inherited": occ.kind == core.CUT
-                    and occ.signature in previous_decisions,
+                    "inherited": occ.kind == core.CUT and occ.signature in inherited,
                     "pending": core.is_pending(occ, decisions),
                 }
             )
         cards.append({"fragment": fragment, "occurrences": frag_cards})
 
-    pending = core.pending_occurrences(fragments, decisions)
     return {
         "row": row,
         "cards": cards,
-        "pending_count": len(pending),
-        "fragment_count": len(fragments),
-        "occurrence_count": len(bundle["occurrences"]),
-        "cut_count": sum(1 for occ in bundle["occurrences"] if occ.kind == core.CUT),
-        "total_ms": sum(fragment.duration_ms for fragment in fragments),
+        "stats": stats,
+        "pending_count": stats["pending_count"],
+        "fragment_count": stats["fragment_count"],
+        "occurrence_count": stats["occurrence_count"],
+        "cut_count": stats["cut_count"],
+        "total_ms": stats["total_ms"],
+        "page": bundle["page"],
+        "pages": bundle["pages"],
+        "page_size": bundle["page_size"],
+        "scope": bundle["scope"],
+        "scope_total": bundle["scope_total"],
         "stale": bundle["stale"],
         "stale_message": (
             "校订页已过期：剪辑表已更换或该页已提交过，请刷新后重新录入。"
@@ -308,3 +284,48 @@ def _draft_view(conn, bundle: dict) -> dict:
         ),
         "error": None,
     }
+
+
+def _stale_response(conn, draft_id: int, page: int, scope: str):
+    view = _draft_view(conn, draft_id, page, scope)
+    view["stale"] = True
+    view["stale_message"] = "校订页已过期：剪辑表已更换或该页已提交过，请刷新后重新录入。"
+    return render_template("draft.html", **view), 409
+
+
+def _submit(draft_id: int, *, publish: bool):
+    conn = get_db()
+    row = core.load_draft(conn, draft_id)
+    if row is None:
+        abort(404)
+    revision = _form_revision()
+    page, scope = _form_page()
+    changes = _collect_changes(request.form)
+    try:
+        if publish:
+            # 页面上的编辑与发布一次提交：先按同一版本号保存本页，再发布。
+            if changes:
+                core.save_page(conn, draft_id, revision, changes)
+            version_no = core.publish(conn, draft_id, revision)
+        else:
+            core.save_page(conn, draft_id, revision, changes)
+    except core.StaleDraft:
+        return _stale_response(conn, draft_id, page, scope)
+    except core.ValidationError as exc:
+        flash(str(exc), "error")
+        return redirect(
+            url_for("draft_page", draft_id=draft_id, page=page, scope=scope)
+        )
+    except core.PublishBlocked as exc:
+        view = _draft_view(conn, draft_id, page, scope)
+        view["error"] = (
+            f"还有 {exc.count} 处剪口字幕未处理，处理完才能发布。"
+            "已处理的内容已保留。"
+        )
+        return render_template("draft.html", **view), 422
+
+    if publish:
+        flash(f"已发布第 {version_no} 版。", "ok")
+        return redirect(url_for("edition_detail", version_no=version_no))
+    flash("本页校订已保存。", "ok")
+    return redirect(url_for("draft_page", draft_id=draft_id, page=page, scope=scope))

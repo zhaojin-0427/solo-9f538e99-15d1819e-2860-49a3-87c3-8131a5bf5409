@@ -1,6 +1,10 @@
 """领域逻辑：WebVTT、剪辑 CSV、时码、出现计算、校订继承、发布存档。
 
 该模块不依赖 Flask，便于单独测试。
+
+计算结果（片段与每一次字幕出现）在建稿时即持久化到 SQLite；翻页、保存、
+统计待校订数都只读取持久化表，不再重算整份剪辑表。旧卷里没有这两张表的
+草稿，在首次载入时一次性回填（见 :func:`ensure_persisted`）。
 """
 from __future__ import annotations
 
@@ -13,6 +17,9 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
+
+# 每页最多展示的片段数（按剪辑顺序）。
+PAGE_SIZE = 20
 
 # ---------------------------------------------------------------------------
 # 时码
@@ -36,9 +43,10 @@ class ValidationError(ValueError):
 class PublishBlocked(RuntimeError):
     """仍有剪口字幕未处理。"""
 
-    def __init__(self, pending: list["Occurrence"]):
-        super().__init__(f"还有 {len(pending)} 处剪口字幕未处理")
-        self.pending = pending
+    def __init__(self, pending: list["Occurrence"] | None = None, count: int | None = None):
+        self.pending = pending or []
+        self.count = len(self.pending) if count is None else count
+        super().__init__(f"还有 {self.count} 处剪口字幕未处理")
 
 
 def parse_timestamp(value: str) -> int:
@@ -295,6 +303,7 @@ class Occurrence:
     text: str       # 原字幕正文
     kind: str
     signature: str
+    id: int = 0     # 持久化后的 occurrence 行号（未持久化为 0）
 
     @property
     def original_range(self) -> tuple[int, int]:
@@ -474,6 +483,45 @@ CREATE TABLE IF NOT EXISTS edition (
     source_draft_id INTEGER,
     vtt_blob BLOB NOT NULL
 );
+
+-- 建稿时持久化的剪辑顺序与每一次字幕出现；旧卷首次载入时一次性回填。
+CREATE TABLE IF NOT EXISTS fragment (
+    draft_id INTEGER NOT NULL REFERENCES draft(id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    fragment_no TEXT NOT NULL,
+    start_ms INTEGER NOT NULL,
+    end_ms INTEGER NOT NULL,
+    offset_ms INTEGER NOT NULL,
+    PRIMARY KEY (draft_id, ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS occurrence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    draft_id INTEGER NOT NULL REFERENCES draft(id) ON DELETE CASCADE,
+    fragment_ordinal INTEGER NOT NULL,
+    cue_index INTEGER NOT NULL,
+    ov_start INTEGER NOT NULL,
+    ov_end INTEGER NOT NULL,
+    out_start INTEGER NOT NULL,
+    out_end INTEGER NOT NULL,
+    cut_start INTEGER NOT NULL,
+    cut_end INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('whole', 'cut')),
+    text TEXT NOT NULL,
+    signature TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_occ_draft_ord ON occurrence(draft_id, fragment_ordinal);
+CREATE INDEX IF NOT EXISTS idx_occ_draft_kind ON occurrence(draft_id, kind);
+"""
+
+# 待校订剪口：没有 decision 行，或 keep 但文字为空白。
+_PENDING_WHERE = """
+o.draft_id = ? AND o.kind = 'cut' AND NOT EXISTS (
+    SELECT 1 FROM decision d
+    WHERE d.draft_id = o.draft_id AND d.signature = o.signature
+      AND (d.status = 'delete'
+           OR (d.status = 'keep' AND trim(d.text) <> ''))
+)
 """
 
 
@@ -532,6 +580,50 @@ def _insert_decisions(
         )
 
 
+def _persist_fragments(
+    conn: sqlite3.Connection, draft_id: int, fragments: list[Fragment]
+) -> None:
+    for fragment in fragments:
+        conn.execute(
+            """
+            INSERT INTO fragment
+                (draft_id, ordinal, fragment_no, start_ms, end_ms, offset_ms)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                draft_id,
+                fragment.order,
+                fragment.fragment_no,
+                fragment.start_ms,
+                fragment.end_ms,
+                fragment.offset_ms,
+            ),
+        )
+        for occ in fragment.occurrences:
+            conn.execute(
+                """
+                INSERT INTO occurrence
+                    (draft_id, fragment_ordinal, cue_index, ov_start, ov_end,
+                     out_start, out_end, cut_start, cut_end, kind, text, signature)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    draft_id,
+                    fragment.order,
+                    occ.cue_index,
+                    occ.ov_start,
+                    occ.ov_end,
+                    occ.out_start,
+                    occ.out_end,
+                    1 if occ.cut_start else 0,
+                    1 if occ.cut_end else 0,
+                    occ.kind,
+                    occ.text,
+                    occ.signature,
+                ),
+            )
+
+
 def create_draft(
     conn: sqlite3.Connection,
     vtt_raw: str,
@@ -541,7 +633,10 @@ def create_draft(
     vtt_filename: str = "",
     csv_filename: str = "",
 ) -> int:
-    """建立新草稿：锁版本递增（旧草稿页随之过期），并沿用上一版可匹配的校订。"""
+    """建立新草稿：锁版本递增（旧草稿页随之过期），并沿用上一版可匹配的校订。
+
+    片段与出现的计算结果在同一事务里持久化，此后翻页与保存都无需重算。
+    """
     fragments = compute_occurrences(cuts, cues)
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -572,6 +667,7 @@ def create_draft(
         _insert_decisions(
             conn, draft_id, inherited_decisions(fragments, previous_decisions)
         )
+        _persist_fragments(conn, draft_id, fragments)
         conn.execute("COMMIT")
         return draft_id
     except Exception:
@@ -583,24 +679,39 @@ def load_draft(conn: sqlite3.Connection, draft_id: int) -> Optional[sqlite3.Row]
     return conn.execute("SELECT * FROM draft WHERE id = ?", (draft_id,)).fetchone()
 
 
-def load_bundle(conn: sqlite3.Connection, draft_id: int) -> Optional[dict]:
+def is_persisted(conn: sqlite3.Connection, draft_id: int) -> bool:
+    """该草稿的片段/出现表是否已写入（旧卷回填判断用）。"""
+    row = conn.execute(
+        "SELECT 1 FROM fragment WHERE draft_id = ? LIMIT 1", (draft_id,)
+    ).fetchone()
+    return row is not None
+
+
+def ensure_persisted(conn: sqlite3.Connection, draft_id: int) -> bool:
+    """确保草稿的片段/出现已持久化。
+
+    旧 SQLite 卷里的草稿没有 fragment/occurrence 行：首次载入时在一个
+    事务里由原 VTT 与剪辑表重算并回填，整个草稿生命周期只发生这一次。
+    已持久化的草稿直接返回，不解析 VTT、不重算剪辑表。
+    返回 True 表示本次调用执行了回填。
+    """
     row = load_draft(conn, draft_id)
     if row is None:
-        return None
-    cues = parse_vtt(row["vtt_raw"])
-    cuts = _parse_cuts(row["cuts_json"])
-    fragments = compute_occurrences(cuts, cues)
-    current_lock = lock_version(conn)
-    return {
-        "row": row,
-        "cues": cues,
-        "cuts": cuts,
-        "fragments": fragments,
-        "occurrences": flatten(fragments),
-        "decisions": decision_rows(conn, draft_id),
-        "lock_version": current_lock,
-        "stale": row["published_version"] is not None
-        or row["revision"] != current_lock,    }
+        return False
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if is_persisted(conn, draft_id):
+            conn.execute("COMMIT")
+            return False
+        cues = parse_vtt(row["vtt_raw"])
+        cuts = _parse_cuts(row["cuts_json"])
+        fragments = compute_occurrences(cuts, cues)
+        _persist_fragments(conn, draft_id, fragments)
+        conn.execute("COMMIT")
+        return True
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
 
 
 def _reject_if_stale(
@@ -618,25 +729,263 @@ def _reject_if_stale(
     return row
 
 
-def save_decisions(
+def count_pending(conn: sqlite3.Connection, draft_id: int) -> int:
+    """全稿待校订剪口数（单条 SQL，不重算剪辑表）。"""
+    return conn.execute(
+        f"SELECT COUNT(*) FROM occurrence o WHERE {_PENDING_WHERE}", (draft_id,)
+    ).fetchone()[0]
+
+
+def count_pending_fragments(conn: sqlite3.Connection, draft_id: int) -> int:
+    """含至少一处待校订剪口的片段数。"""
+    return conn.execute(
+        f"""
+        SELECT COUNT(DISTINCT o.fragment_ordinal) FROM occurrence o
+        WHERE {_PENDING_WHERE}
+        """,
+        (draft_id,),
+    ).fetchone()[0]
+
+
+def draft_statistics(conn: sqlite3.Connection, draft_id: int) -> dict:
+    """工作台/草稿页头部统计，全部来自持久化表。"""
+    fragment_count = conn.execute(
+        "SELECT COUNT(*) FROM fragment WHERE draft_id = ?", (draft_id,)
+    ).fetchone()[0]
+    totals = conn.execute(
+        """
+        SELECT COUNT(*) AS occurrence_count,
+               SUM(CASE WHEN kind = 'cut' THEN 1 ELSE 0 END) AS cut_count,
+               COUNT(DISTINCT cue_index) AS cue_count
+        FROM occurrence WHERE draft_id = ?
+        """,
+        (draft_id,),
+    ).fetchone()
+    total_ms = conn.execute(
+        "SELECT COALESCE(SUM(end_ms - start_ms), 0) FROM fragment WHERE draft_id = ?",
+        (draft_id,),
+    ).fetchone()[0]
+    return {
+        "fragment_count": fragment_count,
+        "occurrence_count": totals["occurrence_count"] or 0,
+        "cut_count": totals["cut_count"] or 0,
+        "cue_count": totals["cue_count"] or 0,
+        "pending_count": count_pending(conn, draft_id),
+        "pending_fragment_count": count_pending_fragments(conn, draft_id),
+        "total_ms": total_ms,
+    }
+
+
+def _row_to_occurrence(row: sqlite3.Row) -> Occurrence:
+    return Occurrence(
+        id=row["id"],
+        cue_index=row["cue_index"],
+        fragment_no=row["fragment_no"] if "fragment_no" in row.keys() else "",
+        fragment_order=row["fragment_ordinal"],
+        ov_start=row["ov_start"],
+        ov_end=row["ov_end"],
+        out_start=row["out_start"],
+        out_end=row["out_end"],
+        cut_start=bool(row["cut_start"]),
+        cut_end=bool(row["cut_end"]),
+        text=row["text"],
+        kind=row["kind"],
+        signature=row["signature"],
+    )
+
+
+def _page_ordinals(
+    conn: sqlite3.Connection, draft_id: int, page: int, scope: str
+) -> tuple[list[int], int]:
+    """取当前页的片段序号（按剪辑顺序）与该范围下的片段总数。"""
+    if scope == "pending":
+        total = count_pending_fragments(conn, draft_id)
+        rows = conn.execute(
+            f"""
+            SELECT DISTINCT o.fragment_ordinal AS ordinal
+            FROM occurrence o WHERE {_PENDING_WHERE}
+            ORDER BY o.fragment_ordinal
+            LIMIT ? OFFSET ?
+            """,
+            (draft_id, PAGE_SIZE, (page - 1) * PAGE_SIZE),
+        ).fetchall()
+    else:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM fragment WHERE draft_id = ?", (draft_id,)
+        ).fetchone()[0]
+        rows = conn.execute(
+            """
+            SELECT ordinal FROM fragment
+            WHERE draft_id = ? ORDER BY ordinal LIMIT ? OFFSET ?
+            """,
+            (draft_id, PAGE_SIZE, (page - 1) * PAGE_SIZE),
+        ).fetchall()
+    return [row["ordinal"] for row in rows], total
+
+
+def load_page(
+    conn: sqlite3.Connection,
+    draft_id: int,
+    page: int,
+    scope: str = "all",
+) -> Optional[dict]:
+    """读取一页草稿（每页最多 PAGE_SIZE 个片段，按剪辑顺序）。
+
+    只查询本页片段及其出现、本页相关校订，不解析 VTT、不重算剪辑表。
+    待校订列表因另一页保存而缩短时，分页仍按当前片段序号窗口取数，
+    不会跳过后面的待校订片段。
+    """
+    row = load_draft(conn, draft_id)
+    if row is None:
+        return None
+    if scope not in ("all", "pending"):
+        scope = "all"
+    page = max(1, page)
+
+    ordinals, scope_total = _page_ordinals(conn, draft_id, page, scope)
+    pages = max(1, (scope_total + PAGE_SIZE - 1) // PAGE_SIZE)
+    if page > pages:
+        # 待校订列表因其他页保存而缩短时，回收到最后一个有效页，避免页脚错位。
+        page = pages
+        ordinals, scope_total = _page_ordinals(conn, draft_id, page, scope)
+        pages = max(1, (scope_total + PAGE_SIZE - 1) // PAGE_SIZE)
+
+    fragments: list[Fragment] = []
+    if ordinals:
+        placeholders = ",".join("?" for _ in ordinals)
+        frag_rows = conn.execute(
+            f"""
+            SELECT * FROM fragment
+            WHERE draft_id = ? AND ordinal IN ({placeholders})
+            ORDER BY ordinal
+            """,
+            [draft_id, *ordinals],
+        ).fetchall()
+        occ_rows = conn.execute(
+            f"""
+            SELECT o.*, f.fragment_no AS fragment_no
+            FROM occurrence o JOIN fragment f
+              ON f.draft_id = o.draft_id AND f.ordinal = o.fragment_ordinal
+            WHERE o.draft_id = ? AND o.fragment_ordinal IN ({placeholders})
+            ORDER BY o.fragment_ordinal, o.cue_index, o.id
+            """,
+            [draft_id, *ordinals],
+        ).fetchall()
+        by_ordinal: dict[int, list[Occurrence]] = {}
+        for occ_row in occ_rows:
+            by_ordinal.setdefault(occ_row["fragment_ordinal"], []).append(
+                _row_to_occurrence(occ_row)
+            )
+        for frag_row in frag_rows:
+            fragments.append(
+                Fragment(
+                    fragment_no=frag_row["fragment_no"],
+                    order=frag_row["ordinal"],
+                    start_ms=frag_row["start_ms"],
+                    end_ms=frag_row["end_ms"],
+                    offset_ms=frag_row["offset_ms"],
+                    occurrences=by_ordinal.get(frag_row["ordinal"], []),
+                )
+            )
+
+    signatures = [
+        occ.signature for fragment in fragments for occ in fragment.occurrences
+    ]
+    decisions = _decisions_for_signatures(conn, draft_id, signatures)
+    previous = conn.execute(
+        "SELECT id FROM draft WHERE id < ? ORDER BY id DESC LIMIT 1", (draft_id,)
+    ).fetchone()
+    inherited = (
+        _previous_signature_hits(conn, previous["id"], signatures)
+        if previous is not None
+        else set()
+    )
+
+    return {
+        "row": row,
+        "fragments": fragments,
+        "page": page,
+        "pages": pages,
+        "page_size": PAGE_SIZE,
+        "scope": scope,
+        "scope_total": scope_total,
+        "decisions": decisions,
+        "inherited": inherited,
+        "stats": draft_statistics(conn, draft_id),
+        "stale": row["published_version"] is not None
+        or row["revision"] != lock_version(conn),
+    }
+
+
+def _decisions_for_signatures(
+    conn: sqlite3.Connection, draft_id: int, signatures: list[str]
+) -> dict[str, dict]:
+    if not signatures:
+        return {}
+    placeholders = ",".join("?" for _ in signatures)
+    out: dict[str, dict] = {}
+    for row in conn.execute(
+        f"""
+        SELECT signature, status, text FROM decision
+        WHERE draft_id = ? AND signature IN ({placeholders})
+        """,
+        [draft_id, *signatures],
+    ):
+        out[row["signature"]] = {"status": row["status"], "text": row["text"]}
+    return out
+
+
+def _previous_signature_hits(
+    conn: sqlite3.Connection, previous_id: int, signatures: list[str]
+) -> set[str]:
+    if not signatures:
+        return set()
+    placeholders = ",".join("?" for _ in signatures)
+    rows = conn.execute(
+        f"""
+        SELECT DISTINCT signature FROM decision
+        WHERE draft_id = ? AND signature IN ({placeholders})
+        """,
+        [previous_id, *signatures],
+    ).fetchall()
+    return {row["signature"] for row in rows}
+
+
+def save_page(
     conn: sqlite3.Connection,
     draft_id: int,
     expected_revision: int,
     changes: list[dict],
 ) -> None:
-    """保存校订；草稿页过期时拒绝。changes: [{signature, status, text}]。"""
+    """保存一页校订；只写入表单本页提交的出现，不触碰其他片段。
+
+    changes: [{occurrence_id, status, text}]。草稿过期或未回填时拒绝，
+    整个过程不解析 VTT、不重算剪辑表。
+    """
     conn.execute("BEGIN IMMEDIATE")
     try:
-        row = _reject_if_stale(conn, draft_id, expected_revision)
-        fragments = compute_occurrences(
-            _parse_cuts(row["cuts_json"]), parse_vtt(row["vtt_raw"])
-        )
-        valid = {occ.signature for occ in flatten(fragments) if occ.kind == CUT}
+        _reject_if_stale(conn, draft_id, expected_revision)
+        if not is_persisted(conn, draft_id):
+            # 旧草稿尚未首次载入：不在这里重算，要求先刷新页面。
+            raise StaleDraft("草稿尚未载入，请刷新页面后重新提交")
+        valid_ids: dict[int, str] = {}
+        if changes:
+            placeholders = ",".join("?" for _ in changes)
+            ids = [int(change["occurrence_id"]) for change in changes]
+            for db_row in conn.execute(
+                f"""
+                SELECT id, signature FROM occurrence
+                WHERE draft_id = ? AND kind = 'cut' AND id IN ({placeholders})
+                """,
+                [draft_id, *ids],
+            ):
+                valid_ids[db_row["id"]] = db_row["signature"]
         now = _utc_now()
         for change in changes:
-            signature = change.get("signature", "")
-            if signature not in valid:
-                raise ValidationError("提交的校订不属于当前剪辑表")
+            occurrence_id = int(change["occurrence_id"])
+            signature = valid_ids.get(occurrence_id)
+            if signature is None:
+                raise ValidationError("提交的校订不属于当前草稿，请刷新页面后重试")
             status = change.get("status")
             if status not in ("keep", "delete"):
                 raise ValidationError("请选择保留文字或标为删除")
@@ -671,6 +1020,21 @@ def save_decisions(
         raise
 
 
+def load_all_occurrences(conn: sqlite3.Connection, draft_id: int) -> list[Occurrence]:
+    """按剪辑顺序取出整稿全部出现（发布生成完整 WebVTT 用）。"""
+    rows = conn.execute(
+        """
+        SELECT o.*, f.fragment_no AS fragment_no
+        FROM occurrence o JOIN fragment f
+          ON f.draft_id = o.draft_id AND f.ordinal = o.fragment_ordinal
+        WHERE o.draft_id = ?
+        ORDER BY o.fragment_ordinal, o.cue_index, o.id
+        """,
+        (draft_id,),
+    ).fetchall()
+    return [_row_to_occurrence(row) for row in rows]
+
+
 def active_draft(conn: sqlite3.Connection) -> Optional[sqlite3.Row]:
     row = conn.execute("SELECT * FROM draft ORDER BY id DESC LIMIT 1").fetchone()
     if row is None or row["published_version"] is not None:
@@ -694,24 +1058,36 @@ def get_edition(conn: sqlite3.Connection, version_no: int) -> Optional[sqlite3.R
 
 
 def publish(conn: sqlite3.Connection, draft_id: int, expected_revision: int) -> int:
-    """发布：所有剪口处理完毕才写入新版；任何失败都不留新版本。"""
+    """发布：所有剪口处理完毕才写入新版；任何失败都不留新版本。
+
+    待校订统计与 WebVTT 生成都基于持久化的出现表，按剪辑顺序输出。
+    """
     conn.execute("BEGIN IMMEDIATE")
     try:
-        row = _reject_if_stale(conn, draft_id, expected_revision)
-        fragments = compute_occurrences(
-            _parse_cuts(row["cuts_json"]), parse_vtt(row["vtt_raw"])
-        )
+        _reject_if_stale(conn, draft_id, expected_revision)
+        if not is_persisted(conn, draft_id):
+            raise StaleDraft("草稿尚未载入，请刷新页面后再发布")
+        pending_count = count_pending(conn, draft_id)
+        if pending_count:
+            raise PublishBlocked(count=pending_count)
+        occurrences = load_all_occurrences(conn, draft_id)
         decisions = decision_rows(conn, draft_id)
-        pending = pending_occurrences(fragments, decisions)
-        if pending:
-            raise PublishBlocked(pending)
-        vtt_text = build_output(fragments, decisions)
+        entries: list[tuple[int, int, list[str]]] = []
+        for occ in occurrences:
+            lines = decision_text(occ, decisions)
+            if not lines:
+                continue
+            entries.append((occ.out_start, occ.out_end, lines))
+        vtt_text = build_vtt(entries)
         blob = vtt_text.encode("utf-8")
         latest = conn.execute(
             "SELECT COALESCE(MAX(version_no), 0) AS v FROM edition"
         ).fetchone()["v"]
         version_no = latest + 1
-        total_ms = sum(fragment.duration_ms for fragment in fragments)
+        total_ms = conn.execute(
+            "SELECT COALESCE(SUM(end_ms - start_ms), 0) FROM fragment WHERE draft_id = ?",
+            (draft_id,),
+        ).fetchone()[0]
         cue_count = sum(1 for line in vtt_text.splitlines() if "-->" in line)
         conn.execute(
             """
